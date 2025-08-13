@@ -5,13 +5,18 @@ import io
 import json
 import asyncio
 import functools
+import time
+import logging
 from datetime import datetime, timedelta
 
 import discord
 from discord import app_commands
+from discord.errors import HTTPException
 
 from openai import OpenAI
 import numpy as np
+import threading  # mini serveur HTTP pour Render Web
+import base64  # pour décoder des credentials en base64 si fournis
 
 # Google Drive API
 from google.oauth2 import service_account
@@ -19,6 +24,18 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 
 from dotenv import load_dotenv
+
+# Configuration des logs
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+# Réduire le niveau de log de discord.py pour éviter le spam
+logging.getLogger('discord').setLevel(logging.WARNING)
+logging.getLogger('discord.http').setLevel(logging.WARNING)
 
 # Charger les variables d'environnement (.env)
 load_dotenv()
@@ -31,6 +48,14 @@ DRIVE_FILE_ID = os.getenv('DRIVE_FILE_ID')
 DRIVE_FOLDER_ID = os.getenv('DRIVE_FOLDER_ID')
 DISCORD_GUILD_ID = os.getenv('DISCORD_GUILD_ID')
 
+# Vérifier les variables d'environnement critiques
+if not DISCORD_TOKEN:
+    logger.error("DISCORD_TOKEN manquant dans les variables d'environnement")
+    exit(1)
+if not OPENAI_API_KEY:
+    logger.error("OPENAI_API_KEY manquant dans les variables d'environnement")
+    exit(1)
+
 # Configurations diverses
 SCENE_BREAK_HOURS = 6  # Seuil de séparation des scènes en heures (changement temporel notable)
 MAX_CHUNK_CHARS = 4000  # Taille approx. des segments de texte pour l'indexation (en caractères)
@@ -38,17 +63,95 @@ MAX_CHUNK_CHARS = 4000  # Taille approx. des segments de texte pour l'indexation
 # Initialiser le client OpenAI
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-# Préparer le client Google Drive si les credentials sont fournis
+# Préparer le client Google Drive si les credentials sont fournis (fichier, JSON brut ou base64)
 drive_service = None
-if GOOGLE_CREDENTIALS_PATH:
+GOOGLE_CREDENTIALS_JSON = os.getenv('GOOGLE_CREDENTIALS_JSON')
+GOOGLE_CREDENTIALS_B64 = os.getenv('GOOGLE_CREDENTIALS_B64')
+
+def init_google_drive():
+    """Initialise le service Google Drive avec gestion d'erreurs améliorée"""
+    global drive_service
     try:
-        creds = service_account.Credentials.from_service_account_file(
-            GOOGLE_CREDENTIALS_PATH,
-            scopes=["https://www.googleapis.com/auth/drive"]
-        )
-        drive_service = build('drive', 'v3', credentials=creds)
+        creds = None
+
+        # Priorité 1: Variable d'environnement JSON directe
+        if GOOGLE_CREDENTIALS_JSON:
+            try:
+                data_str = GOOGLE_CREDENTIALS_JSON
+                # Tenter le décodage base64 si nécessaire
+                try:
+                    decoded = base64.b64decode(data_str, validate=True).decode('utf-8')
+                    data_str = decoded
+                except Exception:
+                    pass  # Garder la chaîne originale si ce n'est pas du base64
+
+                info = json.loads(data_str)
+                creds = service_account.Credentials.from_service_account_info(
+                    info,
+                    scopes=["https://www.googleapis.com/auth/drive"]
+                )
+                logger.info("Credentials Google Drive chargés depuis GOOGLE_CREDENTIALS_JSON")
+            except Exception as e:
+                logger.error(f"Erreur lors de l'utilisation de GOOGLE_CREDENTIALS_JSON: {e}")
+
+        # Priorité 2: Variable d'environnement base64
+        elif GOOGLE_CREDENTIALS_B64:
+            try:
+                decoded = base64.b64decode(GOOGLE_CREDENTIALS_B64).decode('utf-8')
+                info = json.loads(decoded)
+                creds = service_account.Credentials.from_service_account_info(
+                    info,
+                    scopes=["https://www.googleapis.com/auth/drive"]
+                )
+                logger.info("Credentials Google Drive chargés depuis GOOGLE_CREDENTIALS_B64")
+            except Exception as e:
+                logger.error(f"Erreur lors du décodage de GOOGLE_CREDENTIALS_B64: {e}")
+
+        # Priorité 3: Fichier local (seulement si le fichier existe)
+        elif GOOGLE_CREDENTIALS_PATH and os.path.exists(GOOGLE_CREDENTIALS_PATH):
+            try:
+                creds = service_account.Credentials.from_service_account_file(
+                    GOOGLE_CREDENTIALS_PATH,
+                    scopes=["https://www.googleapis.com/auth/drive"]
+                )
+                logger.info(f"Credentials Google Drive chargés depuis le fichier: {GOOGLE_CREDENTIALS_PATH}")
+            except Exception as e:
+                logger.error(f"Erreur lors du chargement du fichier de credentials: {e}")
+
+        # Construire le service si on a des credentials valides
+        if creds:
+            drive_service = build('drive', 'v3', credentials=creds)
+            logger.info("Service Google Drive initialisé avec succès")
+        else:
+            logger.warning("Aucun credential Google Drive valide trouvé - fonctionnalité désactivée")
+
     except Exception as e:
-        print(f"Erreur: Impossible d'initialiser le service Google Drive - {e}")
+        logger.error(f"Erreur: Impossible d'initialiser le service Google Drive - {e}")
+        drive_service = None
+
+# Initialiser Google Drive
+init_google_drive()
+# Petit serveur HTTP de healthcheck pour Render Web (port $PORT)
+def start_healthcheck_server():
+    try:
+        port_str = os.getenv("PORT")
+        if not port_str:
+            return
+        port = int(port_str)
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        class H(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"OK")
+            def log_message(self, *args):
+                # Silence le logging HTTP par défaut
+                pass
+        srv = HTTPServer(("0.0.0.0", port), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        logger.info(f"Healthcheck HTTP actif sur 0.0.0.0:{port}")
+    except Exception as e:
+        logger.error(f"Impossible de démarrer le healthcheck HTTP: {e}")
 
 # Structures de données globales
 scenes_data = []        # Liste des scènes (RP) et entrées de lore info
@@ -234,8 +337,12 @@ intents = discord.Intents.default()
 intents.message_content = True  # pour accéder au contenu des messages
 intents.guilds = True
 
-# Initialiser le bot Discord
-bot = discord.Client(intents=intents)
+# Initialiser le bot Discord avec des timeouts plus longs
+bot = discord.Client(
+    intents=intents,
+    heartbeat_timeout=60.0,  # Timeout pour le heartbeat
+    guild_ready_timeout=10.0  # Timeout pour la synchronisation des guildes
+)
 tree = app_commands.CommandTree(bot)
 
 # Commande slash /setup pour indexer le lore du serveur
@@ -662,5 +769,45 @@ async def on_ready():
         print(f"Erreur de synchronisation des commandes: {e}")
     print(f"{bot.user} est connecté et prêt.")
 
-# Démarrer le bot
-bot.run(DISCORD_TOKEN)
+async def start_bot_with_retry():
+    """Démarre le bot avec retry en cas de rate limiting"""
+    max_retries = 5
+    base_delay = 30  # 30 secondes de base
+
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Tentative de connexion {attempt + 1}/{max_retries}")
+            await bot.start(DISCORD_TOKEN)
+            break  # Si on arrive ici, la connexion a réussi
+        except HTTPException as e:
+            if e.status == 429:  # Rate limited
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)  # Backoff exponentiel
+                    logger.warning(f"Rate limité. Attente de {delay} secondes avant la prochaine tentative...")
+                    await asyncio.sleep(delay)
+                else:
+                    logger.error("Nombre maximum de tentatives atteint. Arrêt du bot.")
+                    raise
+            else:
+                logger.error(f"Erreur HTTP {e.status}: {e}")
+                raise
+        except Exception as e:
+            logger.error(f"Erreur lors du démarrage du bot: {e}")
+            if attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)
+                logger.info(f"Attente de {delay} secondes avant la prochaine tentative...")
+                await asyncio.sleep(delay)
+            else:
+                raise
+
+# Démarrer le bot avec gestion des erreurs
+if __name__ == "__main__":
+    logger.info("Démarrage du bot Discord de Lore RP")
+    start_healthcheck_server()
+    try:
+        asyncio.run(start_bot_with_retry())
+    except KeyboardInterrupt:
+        logger.info("Bot arrêté par l'utilisateur")
+    except Exception as e:
+        logger.error(f"Erreur fatale: {e}")
+        exit(1)

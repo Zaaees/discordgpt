@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: discordgpt-lore-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    plan: starter
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: DISCORD_GUILD_ID
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        value: gpt-4
+      - key: OPENAI_EMBED_MODEL
+        value: text-embedding-ada-002
+      - key: GOOGLE_CREDENTIALS_JSON
+        sync: false
+      - key: DRIVE_FILE_ID
+        sync: false
+      - key: DRIVE_FOLDER_ID
+        sync: false
