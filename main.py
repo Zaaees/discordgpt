@@ -239,21 +239,22 @@ def load_index_data():
             print(f"scenes.json chargé avec {len(scenes_data)} scènes.")
 
             # Charger l'index FAISS
-            print("Chargement de l'index FAISS...")
+            logger.info("Chargement de l'index FAISS...")
             try:
                 faiss = __import__('faiss')  # import dynamique pour éviter erreur si module non chargé
                 faiss_index = faiss.read_index("index.faiss")
                 if faiss_index is None:
-                    print("L'index FAISS chargé est None - fichier probablement corrompu.")
+                    logger.warning("L'index FAISS chargé est None - fichier probablement corrompu.")
                     faiss_index = None
                     return
-                print(f"Index FAISS chargé avec {faiss_index.ntotal} vecteurs.")
+                logger.info(f"Index FAISS chargé avec {faiss_index.ntotal} vecteurs.")
             except ImportError as e:
-                print(f"Erreur d'import FAISS: {e}")
+                logger.warning(f"FAISS non disponible: {e}")
+                logger.warning("Le bot fonctionnera sans recherche vectorielle")
                 faiss_index = None
                 return
             except Exception as e:
-                print(f"Erreur lors du chargement de l'index FAISS: {e}")
+                logger.error(f"Erreur lors du chargement de l'index FAISS: {e}")
                 faiss_index = None
                 return
 
@@ -641,7 +642,10 @@ async def lore_command(interaction: discord.Interaction, question: str):
     await interaction.response.defer(thinking=True)
     # Vérifier que l'index du lore est disponible
     if faiss_index is None or not scenes_data:
-        await interaction.followup.send("Le lore n'est pas encore indexé. Veuillez exécuter /setup d'abord.", ephemeral=True)
+        if not scenes_data:
+            await interaction.followup.send("Le lore n'est pas encore indexé. Veuillez exécuter /setup d'abord.", ephemeral=True)
+        else:
+            await interaction.followup.send("La recherche vectorielle n'est pas disponible (FAISS non installé). Veuillez réinstaller les dépendances.", ephemeral=True)
         return
     try:
         # Obtenir l'embedding de la question utilisateur

@@ -2,7 +2,10 @@ services:
   - type: web
     name: discordgpt-lore-bot
     env: python
-    buildCommand: pip install -r requirements.txt
+    runtime: python-3.11.9
+    buildCommand: |
+      pip install --upgrade pip
+      pip install --no-cache-dir -r requirements.txt
     startCommand: python main.py
     plan: starter
     envVars:
@@ -17,6 +20,8 @@ services:
       - key: OPENAI_EMBED_MODEL
         value: text-embedding-ada-002
       - key: GOOGLE_CREDENTIALS_JSON
+        sync: false
+      - key: GOOGLE_CREDENTIALS_B64
         sync: false
       - key: DRIVE_FILE_ID
         sync: false
