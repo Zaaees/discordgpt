@@ -1,0 +1,6 @@
+discord.py>=2.0.0  
+openai>=0.27.0  
+python-dotenv>=0.21.0  
+google-api-python-client>=2.70.0  
+faiss-cpu>=1.7.3  
+numpy>=1.21.0  

@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.env.*
+dist/
+build/
+.DS_Store
+citadelle-serveur-23730de87edb.json
