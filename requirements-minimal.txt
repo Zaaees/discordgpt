@@ -1,8 +1,0 @@
-# Version minimale sans FAISS pour un déploiement rapide
-discord.py==2.3.2
-openai==1.51.2
-python-dotenv==1.0.0
-google-api-python-client==2.149.0
-google-auth==2.35.0
-numpy==1.24.4
-requests==2.31.0

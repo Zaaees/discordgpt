@@ -5,13 +5,11 @@ import io
 import json
 import asyncio
 import functools
-import time
 import logging
 from datetime import datetime, timedelta
 
 import discord
 from discord import app_commands
-from discord.errors import HTTPException
 
 from openai import OpenAI
 import numpy as np
@@ -25,20 +23,27 @@ from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 
 from dotenv import load_dotenv
 
-# Configuration des logs
+# Charger les variables d'environnement (.env)
+load_dotenv()
+print("Environment loaded successfully")
+import sys
+sys.stdout.flush()
+
+# Configuration du logging
 logging.basicConfig(
     level=logging.INFO,
     format='[%(asctime)s] [%(levelname)s] %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    datefmt='%Y-%m-%d %H:%M:%S',
+    force=True
 )
 logger = logging.getLogger(__name__)
+logger.info("Logger initialized")
 
-# Réduire le niveau de log de discord.py pour éviter le spam
-logging.getLogger('discord').setLevel(logging.WARNING)
-logging.getLogger('discord.http').setLevel(logging.WARNING)
-
-# Charger les variables d'environnement (.env)
-load_dotenv()
+# Vérifier la disponibilité de PyNaCl pour le support vocal
+try:
+    import nacl
+except ImportError:
+    logger.warning("PyNaCl is not installed, voice will NOT be supported")
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 OPENAI_MODEL = os.getenv('OPENAI_MODEL', 'gpt-4')
@@ -48,14 +53,6 @@ DRIVE_FILE_ID = os.getenv('DRIVE_FILE_ID')
 DRIVE_FOLDER_ID = os.getenv('DRIVE_FOLDER_ID')
 DISCORD_GUILD_ID = os.getenv('DISCORD_GUILD_ID')
 
-# Vérifier les variables d'environnement critiques
-if not DISCORD_TOKEN:
-    logger.error("DISCORD_TOKEN manquant dans les variables d'environnement")
-    exit(1)
-if not OPENAI_API_KEY:
-    logger.error("OPENAI_API_KEY manquant dans les variables d'environnement")
-    exit(1)
-
 # Configurations diverses
 SCENE_BREAK_HOURS = 6  # Seuil de séparation des scènes en heures (changement temporel notable)
 MAX_CHUNK_CHARS = 4000  # Taille approx. des segments de texte pour l'indexation (en caractères)
@@ -63,39 +60,46 @@ MAX_CHUNK_CHARS = 4000  # Taille approx. des segments de texte pour l'indexation
 # Initialiser le client OpenAI
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-# Préparer le client Google Drive si les credentials sont fournis (fichier, JSON brut ou base64)
+# Variables pour Google Drive (initialisation lazy)
 drive_service = None
-GOOGLE_CREDENTIALS_JSON = os.getenv('GOOGLE_CREDENTIALS_JSON')
-GOOGLE_CREDENTIALS_B64 = os.getenv('GOOGLE_CREDENTIALS_B64')
+_drive_credentials = None
+_drive_init_attempted = False
 
-def init_google_drive():
-    """Initialise le service Google Drive avec gestion d'erreurs améliorée"""
-    global drive_service
+def get_drive_service():
+    """Initialise et retourne le service Google Drive de manière lazy"""
+    global drive_service, _drive_credentials, _drive_init_attempted
+
+    if _drive_init_attempted:
+        return drive_service
+
+    _drive_init_attempted = True
+    logger.info("Initialisation du service Google Drive...")
+
     try:
         creds = None
+        GOOGLE_CREDENTIALS_JSON = os.getenv('GOOGLE_CREDENTIALS_JSON')
+        GOOGLE_CREDENTIALS_B64 = os.getenv('GOOGLE_CREDENTIALS_B64')
+        GOOGLE_CREDENTIALS_PATH = os.getenv('GOOGLE_CREDENTIALS_PATH')
 
-        # Priorité 1: Variable d'environnement JSON directe
         if GOOGLE_CREDENTIALS_JSON:
+            logger.info("Tentative d'utilisation de GOOGLE_CREDENTIALS_JSON...")
             try:
                 data_str = GOOGLE_CREDENTIALS_JSON
-                # Tenter le décodage base64 si nécessaire
+                # Si la valeur est en base64, tenter le décodage. Sinon, garder tel quel.
                 try:
                     decoded = base64.b64decode(data_str, validate=True).decode('utf-8')
                     data_str = decoded
                 except Exception:
-                    pass  # Garder la chaîne originale si ce n'est pas du base64
-
+                    pass
                 info = json.loads(data_str)
                 creds = service_account.Credentials.from_service_account_info(
                     info,
                     scopes=["https://www.googleapis.com/auth/drive"]
                 )
-                logger.info("Credentials Google Drive chargés depuis GOOGLE_CREDENTIALS_JSON")
             except Exception as e:
                 logger.error(f"Erreur lors de l'utilisation de GOOGLE_CREDENTIALS_JSON: {e}")
-
-        # Priorité 2: Variable d'environnement base64
         elif GOOGLE_CREDENTIALS_B64:
+            logger.info("Tentative d'utilisation de GOOGLE_CREDENTIALS_B64...")
             try:
                 decoded = base64.b64decode(GOOGLE_CREDENTIALS_B64).decode('utf-8')
                 info = json.loads(decoded)
@@ -103,34 +107,25 @@ def init_google_drive():
                     info,
                     scopes=["https://www.googleapis.com/auth/drive"]
                 )
-                logger.info("Credentials Google Drive chargés depuis GOOGLE_CREDENTIALS_B64")
             except Exception as e:
                 logger.error(f"Erreur lors du décodage de GOOGLE_CREDENTIALS_B64: {e}")
+        elif GOOGLE_CREDENTIALS_PATH:
+            logger.info("Tentative d'utilisation de GOOGLE_CREDENTIALS_PATH...")
+            creds = service_account.Credentials.from_service_account_file(
+                GOOGLE_CREDENTIALS_PATH,
+                scopes=["https://www.googleapis.com/auth/drive"]
+            )
 
-        # Priorité 3: Fichier local (seulement si le fichier existe)
-        elif GOOGLE_CREDENTIALS_PATH and os.path.exists(GOOGLE_CREDENTIALS_PATH):
-            try:
-                creds = service_account.Credentials.from_service_account_file(
-                    GOOGLE_CREDENTIALS_PATH,
-                    scopes=["https://www.googleapis.com/auth/drive"]
-                )
-                logger.info(f"Credentials Google Drive chargés depuis le fichier: {GOOGLE_CREDENTIALS_PATH}")
-            except Exception as e:
-                logger.error(f"Erreur lors du chargement du fichier de credentials: {e}")
-
-        # Construire le service si on a des credentials valides
         if creds:
+            logger.info("Credentials trouvés, construction du service Drive...")
             drive_service = build('drive', 'v3', credentials=creds)
-            logger.info("Service Google Drive initialisé avec succès")
+            logger.info("Service Google Drive configuré avec succès")
         else:
             logger.warning("Aucun credential Google Drive valide trouvé - fonctionnalité désactivée")
-
     except Exception as e:
-        logger.error(f"Erreur: Impossible d'initialiser le service Google Drive - {e}")
-        drive_service = None
+        logger.error(f"Impossible d'initialiser le service Google Drive - {e}")
 
-# Initialiser Google Drive
-init_google_drive()
+    return drive_service
 # Petit serveur HTTP de healthcheck pour Render Web (port $PORT)
 def start_healthcheck_server():
     try:
@@ -183,60 +178,66 @@ def ask_gpt(messages, model=OPENAI_MODEL):
 # Charger l'index vectoriel et les données de scènes depuis Google Drive ou local
 def load_index_data():
     global scenes_data, faiss_index, index_id_to_scene
-    print("Début du chargement de l'index...")
+    logger.info("Début du chargement de l'index...")
 
     # Si un fichier local existe, on l'utilise en priorité
     if os.path.exists("lore_index.zip"):
-        print("Fichier lore_index.zip trouvé localement.")
+        logger.info("Fichier lore_index.zip trouvé localement.")
         zip_path = "lore_index.zip"
     else:
-        print("Fichier lore_index.zip non trouvé localement.")
+        logger.info("Fichier lore_index.zip non trouvé localement.")
         zip_path = None
         # Tenter de télécharger le fichier d'index depuis Google Drive si configuré
+        drive_service = get_drive_service()
         if drive_service:
-            print("Tentative de téléchargement depuis Google Drive...")
-            file_id = DRIVE_FILE_ID
-            # Si FILE_ID n'est pas fourni, chercher un fichier par nom dans le dossier
-            if not file_id:
-                query = "name='lore_index.zip'"
-                if DRIVE_FOLDER_ID:
-                    query += f" and '{DRIVE_FOLDER_ID}' in parents"
-                results = drive_service.files().list(q=query, spaces='drive', fields="files(id, name)", pageSize=1).execute()
-                files = results.get('files', [])
-                if files:
-                    file_id = files[0]['id']
-            if file_id:
-                try:
-                    request = drive_service.files().get_media(fileId=file_id)
-                    fh = io.BytesIO()
-                    downloader = MediaIoBaseDownload(fh, request)
-                    done = False
-                    while not done:
-                        status, done = downloader.next_chunk()
-                    fh.seek(0)
-                    with open("lore_index.zip", "wb") as f:
-                        f.write(fh.read())
-                    zip_path = "lore_index.zip"
-                    print("Index téléchargé depuis Google Drive.")
-                except Exception as e:
-                    print(f"Échec du téléchargement de l'index depuis Google Drive: {e}")
+            logger.info("Tentative de téléchargement depuis Google Drive...")
+            try:
+                file_id = DRIVE_FILE_ID
+                # Si FILE_ID n'est pas fourni, chercher un fichier par nom dans le dossier
+                if not file_id:
+                    query = "name='lore_index.zip'"
+                    if DRIVE_FOLDER_ID:
+                        query += f" and '{DRIVE_FOLDER_ID}' in parents"
+                    results = drive_service.files().list(q=query, spaces='drive', fields="files(id, name)", pageSize=1).execute()
+                    files = results.get('files', [])
+                    if files:
+                        file_id = files[0]['id']
+                if file_id:
+                    try:
+                        request = drive_service.files().get_media(fileId=file_id)
+                        fh = io.BytesIO()
+                        downloader = MediaIoBaseDownload(fh, request)
+                        done = False
+                        while not done:
+                            status, done = downloader.next_chunk()
+                        fh.seek(0)
+                        with open("lore_index.zip", "wb") as f:
+                            f.write(fh.read())
+                        zip_path = "lore_index.zip"
+                        logger.info("Index téléchargé depuis Google Drive.")
+                    except Exception as e:
+                        logger.error(f"Échec du téléchargement de l'index depuis Google Drive: {e}")
+                else:
+                    logger.warning("Aucun ID de fichier trouvé pour l'index sur Google Drive")
+            except Exception as e:
+                logger.error(f"Erreur lors de l'accès à Google Drive: {e}")
         else:
-            print("Service Google Drive non configuré.")
+            logger.info("Service Google Drive non configuré.")
 
     # Si on a un zip, l'extraire
     if zip_path:
-        print(f"Extraction du fichier {zip_path}...")
+        logger.info(f"Extraction du fichier {zip_path}...")
         import zipfile
         try:
             with zipfile.ZipFile(zip_path, 'r') as zipf:
                 zipf.extractall(".")
-            print("Extraction réussie.")
+            logger.info("Extraction réussie.")
 
             # Charger les données JSON des scènes
-            print("Chargement de scenes.json...")
+            logger.info("Chargement de scenes.json...")
             with open("scenes.json", "r", encoding="utf-8") as f:
                 scenes_data = json.load(f)
-            print(f"scenes.json chargé avec {len(scenes_data)} scènes.")
+            logger.info(f"scenes.json chargé avec {len(scenes_data)} scènes.")
 
             # Charger l'index FAISS
             logger.info("Chargement de l'index FAISS...")
@@ -250,16 +251,15 @@ def load_index_data():
                 logger.info(f"Index FAISS chargé avec {faiss_index.ntotal} vecteurs.")
             except ImportError as e:
                 logger.warning(f"FAISS non disponible: {e}")
-                logger.warning("Le bot fonctionnera sans recherche vectorielle")
                 faiss_index = None
-                return
+                # Ne pas retourner ici, continuer sans FAISS
             except Exception as e:
                 logger.error(f"Erreur lors du chargement de l'index FAISS: {e}")
                 faiss_index = None
-                return
+                # Ne pas retourner ici, continuer sans FAISS
 
             # Reconstruire la table de correspondance index->scene/chunk
-            print("Reconstruction de la table de correspondance...")
+            logger.info("Reconstruction de la table de correspondance...")
             index_id_to_scene = []
             for scene in scenes_data:
                 # Pour chaque scène, ajouter soit ses chunks, soit la scène entière
@@ -268,18 +268,18 @@ def load_index_data():
                         index_id_to_scene.append((scene["id"], chunk))
                 else:
                     index_id_to_scene.append((scene["id"], None))
-            print(f"Table de correspondance créée avec {len(index_id_to_scene)} entrées.")
-            print(f"{len(scenes_data)} scènes/entrées lore chargées depuis l'index existant.")
+            logger.info(f"Table de correspondance créée avec {len(index_id_to_scene)} entrées.")
+            logger.info(f"{len(scenes_data)} scènes/entrées lore chargées depuis l'index existant.")
 
         except Exception as e:
-            print(f"Erreur lors du chargement de l'index local: {e}")
+            logger.error(f"Erreur lors du chargement de l'index local: {e}")
             import traceback
             traceback.print_exc()
             scenes_data = []
             index_id_to_scene = []
             faiss_index = None
     else:
-        print("Aucun fichier d'index disponible.")
+        logger.info("Aucun fichier d'index disponible.")
         scenes_data = []
         index_id_to_scene = []
         faiss_index = None
@@ -299,6 +299,7 @@ def save_index_data():
         zipf.write("scenes.json")
         zipf.write("index.faiss")
     # Uploader sur Google Drive si configuré
+    drive_service = get_drive_service()
     if drive_service:
         try:
             file_id = DRIVE_FILE_ID
@@ -326,23 +327,25 @@ def save_index_data():
                         file_metadata['parents'] = [DRIVE_FOLDER_ID]
                     media = MediaFileUpload("lore_index.zip", mimetype="application/zip", resumable=True)
                     drive_service.files().create(body=file_metadata, media_body=media).execute()
-            print("Index sauvegardé sur Google Drive.")
+            logger.info("Index sauvegardé sur Google Drive.")
         except Exception as e:
-            print(f"Échec de la sauvegarde sur Google Drive: {e}")
+            logger.error(f"Échec de la sauvegarde sur Google Drive: {e}")
 
-# Pré-charger l'index existant au démarrage si possible
-load_index_data()
+# L'index sera chargé au démarrage du bot dans la fonction main()
 
 # Configurer les intents (lecture du contenu des messages requise)
 intents = discord.Intents.default()
 intents.message_content = True  # pour accéder au contenu des messages
 intents.guilds = True
 
-# Initialiser le bot Discord avec des timeouts plus longs
+# Initialiser le bot Discord avec des paramètres de connexion optimisés
 bot = discord.Client(
     intents=intents,
-    heartbeat_timeout=60.0,  # Timeout pour le heartbeat
-    guild_ready_timeout=10.0  # Timeout pour la synchronisation des guildes
+    heartbeat_timeout=60.0,  # Timeout plus long pour les connexions instables
+    guild_ready_timeout=10.0,  # Timeout pour la synchronisation des guildes
+    max_messages=1000,  # Limiter le cache des messages
+    chunk_guilds_at_startup=False,  # Ne pas charger tous les membres au démarrage
+    member_cache_flags=discord.MemberCacheFlags.none()  # Désactiver le cache des membres
 )
 tree = app_commands.CommandTree(bot)
 
@@ -642,10 +645,7 @@ async def lore_command(interaction: discord.Interaction, question: str):
     await interaction.response.defer(thinking=True)
     # Vérifier que l'index du lore est disponible
     if faiss_index is None or not scenes_data:
-        if not scenes_data:
-            await interaction.followup.send("Le lore n'est pas encore indexé. Veuillez exécuter /setup d'abord.", ephemeral=True)
-        else:
-            await interaction.followup.send("La recherche vectorielle n'est pas disponible (FAISS non installé). Veuillez réinstaller les dépendances.", ephemeral=True)
+        await interaction.followup.send("Le lore n'est pas encore indexé. Veuillez exécuter /setup d'abord.", ephemeral=True)
         return
     try:
         # Obtenir l'embedding de la question utilisateur
@@ -767,51 +767,115 @@ async def on_ready():
         if DISCORD_GUILD_ID:
             guild_obj = discord.Object(id=int(DISCORD_GUILD_ID))
             await tree.sync(guild=guild_obj)
+            logger.info(f"Commandes synchronisées pour la guilde {DISCORD_GUILD_ID}")
         else:
             await tree.sync()
+            logger.info("Commandes synchronisées globalement")
     except Exception as e:
-        print(f"Erreur de synchronisation des commandes: {e}")
-    print(f"{bot.user} est connecté et prêt.")
+        logger.error(f"Erreur de synchronisation des commandes: {e}")
+    logger.info(f"{bot.user} est connecté et prêt.")
 
+@bot.event
+async def on_disconnect():
+    logger.warning("Bot déconnecté de Discord")
+
+@bot.event
+async def on_resumed():
+    logger.info("Connexion Discord reprise")
+
+@bot.event
+async def on_connect():
+    logger.info("Connexion établie avec Discord")
+
+# Fonction pour démarrer le bot avec retry et gestion d'erreurs
 async def start_bot_with_retry():
-    """Démarre le bot avec retry en cas de rate limiting"""
+    """Démarre le bot avec logique de retry et gestion des erreurs de connexion"""
     max_retries = 5
-    base_delay = 30  # 30 secondes de base
+    base_delay = 30  # délai de base en secondes
 
-    for attempt in range(max_retries):
+    for attempt in range(1, max_retries + 1):
         try:
-            logger.info(f"Tentative de connexion {attempt + 1}/{max_retries}")
+            logger.info("Démarrage du bot Discord de Lore RP")
+            logger.info(f"Tentative de connexion {attempt}/{max_retries}")
+
+            # Démarrer le bot
             await bot.start(DISCORD_TOKEN)
-            break  # Si on arrive ici, la connexion a réussi
-        except HTTPException as e:
+
+        except discord.HTTPException as e:
             if e.status == 429:  # Rate limited
-                if attempt < max_retries - 1:
-                    delay = base_delay * (2 ** attempt)  # Backoff exponentiel
-                    logger.warning(f"Rate limité. Attente de {delay} secondes avant la prochaine tentative...")
-                    await asyncio.sleep(delay)
-                else:
+                delay = base_delay * (2 ** (attempt - 1))  # Exponential backoff
+                logger.warning(f"Rate limité. Attente de {delay} secondes avant la prochaine tentative...")
+                await asyncio.sleep(delay)
+                continue
+            else:
+                logger.error(f"Erreur HTTP Discord: {e}")
+                if attempt == max_retries:
                     logger.error("Nombre maximum de tentatives atteint. Arrêt du bot.")
                     raise
-            else:
-                logger.error(f"Erreur HTTP {e.status}: {e}")
-                raise
-        except Exception as e:
-            logger.error(f"Erreur lors du démarrage du bot: {e}")
-            if attempt < max_retries - 1:
-                delay = base_delay * (2 ** attempt)
-                logger.info(f"Attente de {delay} secondes avant la prochaine tentative...")
-                await asyncio.sleep(delay)
-            else:
-                raise
+                await asyncio.sleep(base_delay)
+                continue
 
-# Démarrer le bot avec gestion des erreurs
+        except discord.ConnectionClosed as e:
+            logger.warning(f"Connexion fermée: {e}")
+            if attempt == max_retries:
+                logger.error("Nombre maximum de tentatives atteint. Arrêt du bot.")
+                raise
+            delay = base_delay * (2 ** (attempt - 1))
+            logger.info(f"Reconnexion dans {delay} secondes...")
+            await asyncio.sleep(delay)
+            continue
+
+        except discord.LoginFailure as e:
+            logger.error(f"Échec de connexion - Token invalide: {e}")
+            raise  # Ne pas retry sur les erreurs de token
+
+        except Exception as e:
+            logger.error(f"Erreur inattendue: {e}")
+            if attempt == max_retries:
+                logger.error("Nombre maximum de tentatives atteint. Arrêt du bot.")
+                logger.error(f"Erreur fatale: {e}")
+                raise
+            delay = base_delay * (2 ** (attempt - 1))
+            logger.info(f"Nouvelle tentative dans {delay} secondes...")
+            await asyncio.sleep(delay)
+            continue
+
+        # Si on arrive ici, la connexion a réussi
+        break
+
+    logger.info("Bot connecté avec succès!")
+
+# Fonction principale pour gérer le bot avec gestion d'erreurs
+async def main():
+    """Fonction principale avec gestion des sessions et cleanup"""
+    try:
+        # Charger l'index existant au démarrage si possible
+        logger.info("Chargement de l'index au démarrage...")
+        load_index_data()
+
+        # Démarrer le bot
+        await start_bot_with_retry()
+    except KeyboardInterrupt:
+        logger.info("Arrêt du bot demandé par l'utilisateur")
+    except Exception as e:
+        logger.error(f"Erreur fatale lors du démarrage: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        # Cleanup des ressources
+        if not bot.is_closed():
+            logger.info("Fermeture du bot...")
+            await bot.close()
+        logger.info("Bot arrêté.")
+
+# Démarrer le bot avec gestion d'erreurs
 if __name__ == "__main__":
-    logger.info("Démarrage du bot Discord de Lore RP")
     start_healthcheck_server()
     try:
-        asyncio.run(start_bot_with_retry())
+        asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Bot arrêté par l'utilisateur")
+        logger.info("Arrêt forcé du programme")
     except Exception as e:
-        logger.error(f"Erreur fatale: {e}")
-        exit(1)
+        logger.error(f"Erreur critique: {e}")
+        import traceback
+        traceback.print_exc()
