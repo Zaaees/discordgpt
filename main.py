@@ -81,16 +81,20 @@ def get_drive_service():
         GOOGLE_CREDENTIALS_B64 = os.getenv('GOOGLE_CREDENTIALS_B64')
         GOOGLE_CREDENTIALS_PATH = os.getenv('GOOGLE_CREDENTIALS_PATH')
 
-        if GOOGLE_CREDENTIALS_JSON:
+        if GOOGLE_CREDENTIALS_JSON and GOOGLE_CREDENTIALS_JSON.strip():
             logger.info("Tentative d'utilisation de GOOGLE_CREDENTIALS_JSON...")
             try:
-                data_str = GOOGLE_CREDENTIALS_JSON
+                data_str = GOOGLE_CREDENTIALS_JSON.strip()
                 # Si la valeur est en base64, tenter le décodage. Sinon, garder tel quel.
                 try:
                     decoded = base64.b64decode(data_str, validate=True).decode('utf-8')
                     data_str = decoded
                 except Exception:
                     pass
+
+                # Corriger les séquences d'échappement dans le JSON (notamment \\n -> \n)
+                data_str = data_str.replace('\\n', '\n').replace('\\t', '\t').replace('\\r', '\r')
+
                 info = json.loads(data_str)
                 creds = service_account.Credentials.from_service_account_info(
                     info,
@@ -98,6 +102,7 @@ def get_drive_service():
                 )
             except Exception as e:
                 logger.error(f"Erreur lors de l'utilisation de GOOGLE_CREDENTIALS_JSON: {e}")
+                logger.error(f"Contenu reçu (premiers 200 chars): {GOOGLE_CREDENTIALS_JSON[:200]}...")
         elif GOOGLE_CREDENTIALS_B64:
             logger.info("Tentative d'utilisation de GOOGLE_CREDENTIALS_B64...")
             try:
@@ -341,11 +346,12 @@ intents.guilds = True
 # Initialiser le bot Discord avec des paramètres de connexion optimisés
 bot = discord.Client(
     intents=intents,
-    heartbeat_timeout=60.0,  # Timeout plus long pour les connexions instables
-    guild_ready_timeout=10.0,  # Timeout pour la synchronisation des guildes
-    max_messages=1000,  # Limiter le cache des messages
+    heartbeat_timeout=90.0,  # Timeout plus long pour les connexions instables
+    guild_ready_timeout=15.0,  # Timeout pour la synchronisation des guildes
+    max_messages=500,  # Limiter le cache des messages
     chunk_guilds_at_startup=False,  # Ne pas charger tous les membres au démarrage
-    member_cache_flags=discord.MemberCacheFlags.none()  # Désactiver le cache des membres
+    member_cache_flags=discord.MemberCacheFlags.none(),  # Désactiver le cache des membres
+    connector=None  # Utiliser le connector par défaut d'aiohttp
 )
 tree = app_commands.CommandTree(bot)
 
@@ -791,12 +797,17 @@ async def on_connect():
 async def start_bot_with_retry():
     """Démarre le bot avec logique de retry et gestion des erreurs de connexion"""
     max_retries = 5
-    base_delay = 30  # délai de base en secondes
+    base_delay = 60  # délai de base en secondes (augmenté pour éviter le rate limiting)
 
     for attempt in range(1, max_retries + 1):
         try:
             logger.info("Démarrage du bot Discord de Lore RP")
             logger.info(f"Tentative de connexion {attempt}/{max_retries}")
+
+            # Fermer toute session existante avant de redémarrer
+            if not bot.is_closed():
+                await bot.close()
+                await asyncio.sleep(5)  # Attendre que la fermeture soit complète
 
             # Démarrer le bot
             await bot.start(DISCORD_TOKEN)
