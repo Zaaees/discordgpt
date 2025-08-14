@@ -85,10 +85,17 @@ def get_drive_service():
             logger.info("Tentative d'utilisation de GOOGLE_CREDENTIALS_JSON...")
             try:
                 data_str = GOOGLE_CREDENTIALS_JSON.strip()
+
+                # Nettoyer la chaîne si elle contient accidentellement le nom de la variable au début
+                if data_str.startswith('GOOGLE_CREDENTIALS_JSON='):
+                    data_str = data_str[len('GOOGLE_CREDENTIALS_JSON='):]
+                    logger.info("Nom de variable détecté et supprimé du début de la chaîne")
+
                 # Si la valeur est en base64, tenter le décodage. Sinon, garder tel quel.
                 try:
                     decoded = base64.b64decode(data_str, validate=True).decode('utf-8')
                     data_str = decoded
+                    logger.info("Décodage base64 réussi")
                 except Exception:
                     pass
 
@@ -100,9 +107,17 @@ def get_drive_service():
                     info,
                     scopes=["https://www.googleapis.com/auth/drive"]
                 )
+                logger.info("Credentials Google créés avec succès")
             except Exception as e:
                 logger.error(f"Erreur lors de l'utilisation de GOOGLE_CREDENTIALS_JSON: {e}")
                 logger.error(f"Contenu reçu (premiers 200 chars): {GOOGLE_CREDENTIALS_JSON[:200]}...")
+                # Log supplémentaire pour diagnostiquer
+                try:
+                    logger.error(f"Longueur totale: {len(GOOGLE_CREDENTIALS_JSON)}")
+                    if 'GOOGLE_CREDENTIALS_JSON=' in GOOGLE_CREDENTIALS_JSON:
+                        logger.error("La variable contient 'GOOGLE_CREDENTIALS_JSON=' - vérifiez la configuration sur Render")
+                except:
+                    pass
         elif GOOGLE_CREDENTIALS_B64:
             logger.info("Tentative d'utilisation de GOOGLE_CREDENTIALS_B64...")
             try:
