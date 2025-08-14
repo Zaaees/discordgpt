@@ -794,7 +794,7 @@ async def on_ready():
             logger.info("Commandes synchronisées globalement")
     except Exception as e:
         logger.error(f"Erreur de synchronisation des commandes: {e}")
-    logger.info(f"{bot.user} est connecté et prêt.")
+    logger.info(f"{bot.user} est connecté avec succès et prêt.")
 
 @bot.event
 async def on_disconnect():
@@ -824,8 +824,9 @@ async def start_bot_with_retry():
                 await bot.close()
                 await asyncio.sleep(5)  # Attendre que la fermeture soit complète
 
-            # Démarrer le bot
+            # Démarrer le bot et attendre sa fermeture explicite
             await bot.start(DISCORD_TOKEN)
+            await bot.wait_until_closed()
 
         except discord.HTTPException as e:
             if e.status == 429:  # Rate limited
@@ -869,7 +870,6 @@ async def start_bot_with_retry():
         # Si on arrive ici, la connexion a réussi
         break
 
-    logger.info("Bot connecté avec succès!")
 
 # Fonction principale pour gérer le bot avec gestion d'erreurs
 async def main():
@@ -888,10 +888,6 @@ async def main():
         import traceback
         traceback.print_exc()
     finally:
-        # Cleanup des ressources
-        if not bot.is_closed():
-            logger.info("Fermeture du bot...")
-            await bot.close()
         logger.info("Bot arrêté.")
 
 # Démarrer le bot avec gestion d'erreurs
